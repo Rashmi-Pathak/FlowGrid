@@ -1,0 +1,330 @@
+"use client"
+
+import { createClient } from '@/utils/supabase/client'
+import type { SupabaseClient, User } from '@supabase/supabase-js'
+import type {
+  Invitation,
+  Message,
+  MessageThread,
+  Notification as AppNotification,
+  Member,
+} from '@/types/workspaces'
+
+function requireUser(user: User | null): asserts user is User {
+  if (!user) throw new Error('You must be signed in')
+}
+
+function randToken(len = 10): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnopqrstuvwxyz'
+  let out = ''
+  crypto.getRandomValues(new Uint8Array(len)).forEach((v) => (out += alphabet[v % alphabet.length]))
+  return out
+}
+
+export async function inviteUserToWorkspace(workspaceId: string, email: string): Promise<{ invitation: Invitation; token: string }>
+{
+  const supabase = createClient()
+  const {
+    data: { user },
+    error: authErr,
+  } = await supabase.auth.getUser()
+  if (authErr) throw new Error(authErr.message)
+  requireUser(user)
+
+  // Permission: only workspace owner/admin can invite
+  const { data: membership } = await supabase
+    .from('workspace_members')
+    .select('role')
+    .eq('workspace_id', workspaceId)
+    .eq('user_id', user.id)
+    .maybeSingle<{ role: 'owner' | 'admin' | 'member' | 'viewer' }>()
+  const role = membership?.role ?? null
+  const isAdmin = role === 'owner' || role === 'admin'
+  if (!isAdmin) {
+    throw new Error('Not allowed')
+  }
+
+  const token = randToken(12)
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+
+  const { data, error } = await supabase
+    .from('workspace_invitations')
+    .insert({
+      workspace_id: workspaceId,
+      email: email.trim().toLowerCase(),
+      invited_by: user.id,
+      token,
+      status: 'pending',
+      expires_at: expiresAt,
+    } as any)
+    .select('*')
+    .single<Invitation>()
+
+  if (error) throw new Error(error.message)
+  return { invitation: data!, token }
+}
+
+export async function acceptInvitation(token: string): Promise<{ workspace: { id: string; name: string; owner_id: string } }>
+{
+  const supabase = createClient()
+  const {
+    data: { user },
+    error: authErr,
+  } = await supabase.auth.getUser()
+  if (authErr) throw new Error(authErr.message)
+  requireUser(user)
+
+  // Use secure RPC to accept invitation and create membership server-side
+  const { data, error } = await (supabase as any).rpc('accept_workspace_invitation', { invite_token: token })
+  if (error) throw new Error(error.message)
+  const row = (Array.isArray(data) ? data[0] : data) as { workspace_id: string; name: string; owner_id: string }
+  if (!row) throw new Error('Invitation not found or expired')
+
+    // Best-effort: persist member's email and name to workspace_members for this workspace
+    try {
+      const workspaceId = row.workspace_id
+      const uid = user.id
+      const email = user.email ?? null
+      // Get display name from profiles table
+      let display: string | null = null
+      try {
+        const { data: prof } = await supabase.from('profiles').select('full_name').eq('id', uid).maybeSingle<any>()
+        display = (prof?.full_name as string | null) ?? null
+      } catch {}
+
+    // Try to update using likely column names; ignore if columns not present
+    try {
+      await supabase
+        .from('workspace_members')
+        .update({ member_email: email, member_name: display } as any)
+        .eq('workspace_id', workspaceId)
+        .eq('user_id', uid)
+    } catch {}
+    try {
+      await supabase
+        .from('workspace_members')
+        .update({ email: email, name: display } as any)
+        .eq('workspace_id', workspaceId)
+        .eq('user_id', uid)
+    } catch {}
+  } catch {}
+  return { workspace: { id: row.workspace_id, name: row.name, owner_id: row.owner_id } }
+}
+
+export async function searchUsersByEmailLike(term: string): Promise<Array<{ id: string; email: string }>> {
+  const supabase = createClient()
+  const t = term.trim()
+  if (!t) return []
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, email')
+    .ilike('email', `%${t}%`)
+    .limit(20)
+  if (error) throw new Error(error.message)
+  return ((data ?? []) as Array<{ id: string; email: string | null }>)
+    .filter((u) => !!u.email && !!u.id)
+    .map((u) => ({ id: u.id, email: u.email! }))
+}
+
+export async function createThread(workspaceId: string, title?: string): Promise<MessageThread> {
+  const supabase = createClient()
+  const {
+    data: { user },
+    error: authErr,
+  } = await supabase.auth.getUser()
+  if (authErr) throw new Error(authErr.message)
+  requireUser(user)
+
+  // Check membership up-front to surface clearer errors before RLS triggers
+  const { data: membership, error: membershipErr } = await supabase
+    .from('workspace_members')
+    .select('role')
+    .eq('workspace_id', workspaceId)
+    .eq('user_id', user.id)
+    .maybeSingle<{ role: string }>()
+  if (membershipErr) {
+    console.error('[createThread] Failed to confirm membership', {
+      workspaceId,
+      userId: user.id,
+      error: membershipErr,
+    })
+    throw new Error('Unable to verify workspace membership')
+  }
+  if (!membership) {
+    console.error('[createThread] User is not a workspace member', {
+      workspaceId,
+      userId: user.id,
+    })
+    throw new Error('You must be a workspace member to start a conversation')
+  }
+
+  const payload = { workspace_id: workspaceId, title: title ?? null, created_by: user.id } as any
+
+  const { data: thread, error } = await supabase
+    .from('message_threads')
+    .insert(payload)
+    .select('*')
+    .single<MessageThread>()
+  if (error) {
+    console.error('[createThread] Insert failed', {
+      workspaceId,
+      userId: user.id,
+      payload,
+      error,
+    })
+    throw new Error(error.message)
+  }
+
+  const participantsParam = [{ user_id: user.id, is_admin: true }]
+  const { error: participantError } = await supabase.rpc('add_thread_participants', {
+    thread_id_param: thread.id,
+    participants_param: participantsParam,
+  })
+  if (participantError) {
+    console.error('[createThread] Failed to seed participants', {
+      threadId: thread.id,
+      userId: user.id,
+      error: participantError,
+    })
+    throw new Error(participantError.message)
+  }
+
+  return thread
+}
+
+export async function sendMessage(threadId: string, workspaceId: string, body: string): Promise<Message> {
+  const supabase = createClient()
+  const {
+    data: { user },
+    error: authErr,
+  } = await supabase.auth.getUser()
+  if (authErr) throw new Error(authErr.message)
+  requireUser(user)
+  const text = body.trim()
+  if (!text) throw new Error('Message cannot be empty')
+
+  const { data: message, error } = await supabase
+    .from('messages')
+    .insert({ thread_id: threadId, workspace_id: workspaceId, author_id: user.id, body: text } as any)
+    .select('*')
+    .single<Message>()
+  if (error) throw new Error(error.message)
+
+  // Determine recipients: participants if present, else all workspace members
+  const {
+    data: participantRows,
+    error: participantError,
+  } = await supabase.rpc('get_thread_participants', {
+    thread_id_param: threadId,
+  })
+  if (participantError && participantError.message !== 'Not allowed') {
+    throw new Error(participantError.message)
+  }
+  let recipients: string[] = []
+  if (participantRows && participantRows.length > 0) {
+    recipients = (participantRows as any[]).map((p) => p.user_id as string)
+  } else {
+    const { data: members, error: memErr } = await supabase
+      .from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', workspaceId)
+    if (memErr) throw new Error(memErr.message)
+    recipients = (members ?? []).map((m: any) => m.user_id as string)
+  }
+  recipients = recipients.filter((id) => id && id !== user.id)
+  if (recipients.length) {
+    const type = text.match(/@\w+/) ? 'message_mention' : 'message_new'
+    try {
+      await fetch('/api/notifications/fanout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type,
+          actorId: user.id,
+          recipients,
+          workspaceId,
+          threadId: threadId,
+          messageId: message.id,
+          meta: { actor_name: null, snippet: text.slice(0, 140) },
+        }),
+      })
+    } catch {}
+  }
+  return message
+}
+
+export async function assignTask(taskId: string, assigneeId: string): Promise<{ id: string }>
+{
+  const supabase = createClient()
+  const {
+    data: { user },
+    error: authErr,
+  } = await supabase.auth.getUser()
+  if (authErr) throw new Error(authErr.message)
+  requireUser(user)
+
+  // Load task to determine workspace
+  const { data: taskRow, error: taskErr } = await supabase
+    .from('tasks')
+    .select('id, workspace_id, title')
+    .eq('id', taskId)
+    .maybeSingle<{ id: string; workspace_id: string | null; title: string | null }>()
+  if (taskErr) throw new Error(taskErr.message)
+  if (!taskRow) throw new Error('Task not found')
+
+  const workspaceId = taskRow.workspace_id as string | null
+  if (!workspaceId) throw new Error('Task workspace unknown')
+
+  // Permission: only owner/admin can assign
+  const { data: membership } = await supabase
+    .from('workspace_members')
+    .select('role')
+    .eq('workspace_id', workspaceId)
+    .eq('user_id', user.id)
+    .maybeSingle<{ role: 'owner' | 'admin' | 'member' | 'viewer' }>()
+  const role = membership?.role ?? null
+  const isAdmin = role === 'owner' || role === 'admin'
+  if (!isAdmin) throw new Error('Not allowed')
+
+  // Additional rule: admins cannot assign tasks to themselves
+  if (role === 'admin' && assigneeId === user.id) {
+    throw new Error('Admins cannot assign themselves')
+  }
+
+  // Validate that the target assignee is a member of this workspace
+  const { data: assigneeMembership } = await supabase
+    .from('workspace_members')
+    .select('user_id')
+    .eq('workspace_id', workspaceId)
+    .eq('user_id', assigneeId)
+    .maybeSingle<{ user_id: string }>()
+  if (!assigneeMembership) {
+    throw new Error('Assignee must be a member of the workspace')
+  }
+
+  const { data: task, error } = await supabase
+    .from('tasks')
+    .update({ assignee_id: assigneeId } as any)
+    .eq('id', taskId)
+    .select('id, workspace_id, title')
+    .maybeSingle<any>()
+  if (error) throw new Error(error.message)
+  if (!task) throw new Error('Task not found')
+
+  try {
+    await fetch('/api/notifications/fanout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'task_assigned',
+        actorId: user.id,
+        recipients: [assigneeId],
+        workspaceId: task.workspace_id ?? null,
+        taskId,
+        meta: { task_title: task.title ?? null },
+      }),
+    })
+  } catch {}
+
+  return { id: taskId }
+}
