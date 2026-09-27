@@ -1,6 +1,6 @@
-# Flowgrid - Project Management Application
+# FlowGrid - Project Management Application
 
-![Flowgrid Banner](public/FlowFoundry.png)
+![FlowGrid Banner](public/FlowGrid.png)
 
 A modern, **100% free and open-source** project management application built with Next.js 16, Supabase, and TypeScript. Features real-time collaboration, drag-and-drop task management, workspace chat, and a beautiful theme-aware interface.
 
@@ -124,7 +124,7 @@ A modern, **100% free and open-source** project management application built wit
 ## Project Structure
 
 ```
-Flowgrid/
+FlowGrid/
 ├── app/                          # Next.js app directory
 │   ├── (pages)/                  # Route groups
 │   │   ├── (auth)/              # Authentication pages
@@ -175,8 +175,8 @@ Flowgrid/
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd Flowgrid
+git clone https://github.com/Rashmi-Pathak/FlowGrid.git
+cd FlowGrid
 ```
 
 2. Install dependencies:
